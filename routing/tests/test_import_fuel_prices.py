@@ -188,6 +188,7 @@ class ImportFuelPricesTests(TestCase):
             32.0000,
             srid=4326,
         )
+        station.geocoding_job_id = "job-123"
         station.geocoding_provider = "geoapify"
         station.geocoding_status = (
             FuelStation.GeocodingStatus.EXACT
@@ -226,6 +227,10 @@ class ImportFuelPricesTests(TestCase):
             station.geocoding_provider,
             "geoapify",
         )
+        self.assertEqual(
+            station.geocoding_job_id,
+            "job-123",
+        )
 
     def test_address_change_resets_existing_geocoding(self):
         original_path = self.write_csv(
@@ -246,6 +251,7 @@ class ImportFuelPricesTests(TestCase):
             32.0000,
             srid=4326,
         )
+        station.geocoding_job_id = "job-123"
         station.geocoding_provider = "geoapify"
         station.geocoding_status = (
             FuelStation.GeocodingStatus.EXACT
@@ -273,6 +279,7 @@ class ImportFuelPricesTests(TestCase):
         station.refresh_from_db()
 
         self.assertIsNone(station.location)
+        self.assertEqual(station.geocoding_job_id, "")
         self.assertEqual(station.geocoding_provider, "")
         self.assertEqual(
             station.geocoding_status,

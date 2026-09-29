@@ -88,6 +88,7 @@ MUTABLE_IMPORT_FIELDS = (
 
 GEOCODING_FIELDS = (
     "location",
+    "geocoding_job_id",
     "geocoding_provider",
     "geocoding_status",
     "geocoding_confidence",
@@ -458,6 +459,7 @@ class Command(BaseCommand):
     def reset_geocoding(station):
         station.location = None
         station.geocoding_provider = ""
+        station.geocoding_job_id = ""
         station.geocoding_status = (
             FuelStation.GeocodingStatus.PENDING
         )

@@ -5,6 +5,7 @@ from django.db import models
 class FuelStation(models.Model):
     class GeocodingStatus(models.TextChoices):
         PENDING = "pending", "Pending"
+        SUBMITTED = "submitted", "Submitted"
         EXACT = "exact", "Exact"
         HIGH_CONFIDENCE = "high_confidence", "High confidence"
         APPROXIMATE = "approximate", "Approximate"
@@ -34,6 +35,12 @@ class FuelStation(models.Model):
         spatial_index=True,
         null=True,
         blank=True,
+    )
+
+    geocoding_job_id = models.CharField(
+        max_length=100,
+        blank=True,
+        db_index=True,
     )
 
     geocoding_provider = models.CharField(
