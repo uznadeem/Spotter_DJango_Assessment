@@ -156,3 +156,12 @@ MAILERS = {
 
 GEOAPIFY_API_KEY = os.getenv("GEOAPIFY_API_KEY", "")
 ORS_API_KEY = os.getenv("ORS_API_KEY", "")
+
+GEOAPIFY_BASE_URL = os.getenv(
+    "GEOAPIFY_BASE_URL",
+    "https://api.geoapify.com",
+)
+
+HTTP_TIMEOUT_SECONDS = float(
+    os.getenv("HTTP_TIMEOUT_SECONDS", "30")
+)
