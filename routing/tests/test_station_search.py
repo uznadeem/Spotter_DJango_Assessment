@@ -232,3 +232,31 @@ class RouteStationSearchTests(TestCase):
             ],
             [2, 1],
         )
+
+    def test_excludes_station_more_than_five_miles_away(
+        self,
+    ):
+        self.create_station(
+            1,
+            -94.93,
+            35.0,
+            status=FuelStation.GeocodingStatus.EXACT,
+        )
+        self.create_station(
+            2,
+            -94.89,
+            35.0,
+            status=FuelStation.GeocodingStatus.EXACT,
+        )
+
+        stations = find_stations_near_route(
+            self.route
+        )
+
+        self.assertEqual(
+            [
+                station.opis_id
+                for station in stations
+            ],
+            [1],
+        )
