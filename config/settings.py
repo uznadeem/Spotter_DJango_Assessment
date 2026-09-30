@@ -165,3 +165,22 @@ GEOAPIFY_BASE_URL = os.getenv(
 HTTP_TIMEOUT_SECONDS = float(
     os.getenv("HTTP_TIMEOUT_SECONDS", "30")
 )
+
+ORS_BASE_URL = os.getenv(
+    "ORS_BASE_URL",
+    "https://api.openrouteservice.org",
+)
+
+ORS_GEOCODING_CACHE_TIMEOUT = int(
+    os.getenv(
+        "ORS_GEOCODING_CACHE_TIMEOUT",
+        str(60 * 60 * 24 * 30),
+    )
+)
+
+ORS_ROUTE_CACHE_TIMEOUT = int(
+    os.getenv(
+        "ORS_ROUTE_CACHE_TIMEOUT",
+        str(60 * 60 * 24),
+    )
+)
