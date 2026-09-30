@@ -1,3 +1,4 @@
+import re
 from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -6,6 +7,7 @@ from math import isfinite
 from django.contrib.gis.geos import Point
 from django.core.management.base import BaseCommand, CommandError
 from django.db import DatabaseError
+from django.db.models import Q
 from django.utils import timezone
 
 from routing.models import FuelStation
@@ -21,6 +23,7 @@ from routing.services.geoapify import (
 DEFAULT_BATCH_SIZE = 1000
 DEFAULT_PRIORITY = 0.5
 GEOCODING_PROVIDER = "geoapify"
+STATION_RETRY_RADIUS_METERS = 50_000
 
 MINIMUM_CONFIDENCE = Decimal("0.5000")
 HIGH_CONFIDENCE = Decimal("0.8000")
@@ -60,6 +63,50 @@ GEOCODING_UPDATE_FIELDS = (
     "updated_at",
 )
 
+BRAND_ALIASES = (
+    (re.compile(r"\bFLYING\s+J\b", re.IGNORECASE), "Flying J"),
+    (
+        re.compile(r"\bPILOT\b", re.IGNORECASE),
+        "Pilot Travel Center",
+    ),
+    (
+        re.compile(r"\bLOVE'?S\b", re.IGNORECASE),
+        "Love's Travel Stop",
+    ),
+    (
+        re.compile(r"\bPETRO\b", re.IGNORECASE),
+        "Petro Travel Center",
+    ),
+    (
+        re.compile(r"^TA(?:\s|$)", re.IGNORECASE),
+        "TA Travel Center",
+    ),
+    (
+        re.compile(r"\bCIRCLE\s+K\b", re.IGNORECASE),
+        "Circle K",
+    ),
+    (
+        re.compile(r"\bKWIK\s+TRIP\b", re.IGNORECASE),
+        "Kwik Trip",
+    ),
+    (
+        re.compile(r"\bSAPP\s+BROS\b", re.IGNORECASE),
+        "Sapp Bros Travel Center",
+    ),
+    (
+        re.compile(r"\bONE9\b", re.IGNORECASE),
+        "One9",
+    ),
+    (
+        re.compile(r"\bSPEEDWAY\b", re.IGNORECASE),
+        "Speedway",
+    ),
+    (
+        re.compile(r"\bSINCLAIR\b", re.IGNORECASE),
+        "Sinclair",
+    ),
+)
+
 
 @dataclass(frozen=True)
 class GeocodingOutcome:
@@ -69,18 +116,88 @@ class GeocodingOutcome:
     matched_address: str
 
 
-def build_geocoding_query(station):
-    """Build the address sent to Geoapify."""
+def normalize_station_name(name):
+    """Remove store IDs and normalize well-known fuel brands."""
 
-    return ", ".join(
-        (
-            station.name,
-            station.address,
-            station.city,
-            station.state,
-            "USA",
-        )
+    normalized_name = " ".join(name.split())
+
+    for pattern, canonical_name in BRAND_ALIASES:
+        if pattern.search(normalized_name):
+            return canonical_name
+
+    normalized_name = re.sub(
+        r"\s+#\s*[A-Z0-9-]+\b",
+        "",
+        normalized_name,
+        flags=re.IGNORECASE,
     )
+
+    return normalized_name.strip()
+
+
+def build_geocoding_params(station):
+    """Build a structured amenity lookup for Geoapify."""
+
+    return {
+        "name": normalize_station_name(station.name),
+        "city": station.city,
+        "state": station.state,
+        "country": "United States",
+        "type": "amenity",
+    }
+
+
+def build_city_geocoding_params(station):
+    """Build a deduplicated city-level fallback lookup."""
+
+    return {
+        "city": station.city,
+        "state": station.state,
+        "country": "United States",
+        "type": "city",
+    }
+
+
+def build_proximity_retry_params(station):
+    """Build a station lookup constrained around its city point."""
+
+    if station.location is None:
+        raise ValueError(
+            "A city-centroid location is required for retry."
+        )
+
+    params = build_geocoding_params(station)
+    params["filter"] = (
+        f"circle:{station.location.x:.6f},"
+        f"{station.location.y:.6f},"
+        f"{STATION_RETRY_RADIUS_METERS}"
+    )
+
+    return params
+
+
+def normalize_locality(value):
+    """Normalize city names for tolerant comparisons."""
+
+    return " ".join(
+        re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            str(value).casefold(),
+        ).split()
+    )
+
+
+def cities_match(station_city, candidate_city):
+    """Allow exact and contained city-name matches."""
+
+    expected = normalize_locality(station_city)
+    candidate = normalize_locality(candidate_city)
+
+    if not expected or not candidate:
+        return True
+
+    return expected in candidate or candidate in expected
 
 
 def parse_confidence(value):
@@ -197,6 +314,56 @@ def classify_geocoding_result(station, provider_result):
             matched_address=matched_address,
         )
 
+    result_params = provider_result.get("params")
+    is_city_fallback = (
+        isinstance(result_params, dict)
+        and str(
+            result_params.get("type") or ""
+        ).strip().lower()
+        == "city"
+    )
+    result_filter = (
+        str(result_params.get("filter") or "")
+        if isinstance(result_params, dict)
+        else ""
+    )
+    is_proximity_retry = (
+        isinstance(result_params, dict)
+        and str(
+            result_params.get("type") or ""
+        ).strip().lower()
+        == "amenity"
+        and result_filter.startswith("circle:")
+    )
+
+    candidate_localities = [
+        candidate.get(field)
+        for field in (
+            "name",
+            "city",
+            "suburb",
+            "district",
+            "town",
+            "village",
+            "municipality",
+        )
+        if candidate.get(field)
+    ]
+
+    locality_matches = (
+        not candidate_localities
+        or any(
+            cities_match(station.city, locality)
+            for locality in candidate_localities
+        )
+    )
+
+    if not locality_matches and not is_proximity_retry:
+        return unmatched_outcome(
+            confidence=confidence,
+            matched_address=matched_address,
+        )
+
     coordinates = parse_coordinates(candidate)
 
     if coordinates is None:
@@ -239,10 +406,15 @@ def classify_geocoding_result(station, provider_result):
             matched_address=matched_address,
         )
 
-    if result_type in CITY_LEVEL_RESULT_TYPES:
+    if (
+        is_city_fallback
+        or result_type in CITY_LEVEL_RESULT_TYPES
+    ):
         status = (
             FuelStation.GeocodingStatus.CITY_CENTROID
         )
+    elif is_proximity_retry and not locality_matches:
+        status = FuelStation.GeocodingStatus.APPROXIMATE
     elif (
         confidence >= EXACT_CONFIDENCE
         and result_type in EXACT_RESULT_TYPES
@@ -283,6 +455,22 @@ class Command(BaseCommand):
             help=(
                 "Retrieve and apply a previously submitted "
                 "Geoapify batch."
+            ),
+        )
+        mode.add_argument(
+            "--submit-city-fallback",
+            action="store_true",
+            help=(
+                "Submit one deduplicated batch of city-level "
+                "lookups for unmatched stations."
+            ),
+        )
+        mode.add_argument(
+            "--submit-station-retry",
+            action="store_true",
+            help=(
+                "Retry city-centroid stations within a "
+                "50-kilometre search radius."
             ),
         )
 
@@ -327,11 +515,34 @@ class Command(BaseCommand):
             )
             return
 
+        if options["submit_city_fallback"]:
+            self.submit_city_fallback_batch(
+                batch_size=batch_size,
+                priority=priority,
+            )
+            return
+
+        if options["submit_station_retry"]:
+            self.submit_station_retry_batch(
+                batch_size=batch_size,
+                priority=priority,
+            )
+            return
+
         self.preview(batch_size=batch_size)
 
     def preview(self, *, batch_size):
         pending_stations = self.pending_stations()
         pending_count = pending_stations.count()
+        unmatched_stations = self.unmatched_stations()
+        unmatched_count = unmatched_stations.count()
+        unmatched_city_count = unmatched_stations.values(
+            "city",
+            "state",
+        ).distinct().count()
+        city_centroid_count = (
+            self.city_centroid_stations().count()
+        )
 
         submitted_job_ids = list(
             FuelStation.objects.filter(
@@ -357,6 +568,15 @@ class Command(BaseCommand):
         output = [
             "Fuel-station geocoding preview.",
             f"Pending stations: {pending_count}",
+            f"Unmatched stations: {unmatched_count}",
+            (
+                "Unmatched city/state fallback groups: "
+                f"{unmatched_city_count}"
+            ),
+            (
+                "City-centroid stations ready for retry: "
+                f"{city_centroid_count}"
+            ),
             (
                 "Stations selected for the next batch: "
                 f"{len(selected_stations)}"
@@ -391,6 +611,248 @@ class Command(BaseCommand):
 
         self.stdout.write("\n".join(output))
 
+    def submit_city_fallback_batch(
+        self,
+        *,
+        batch_size,
+        priority,
+    ):
+        unmatched_stations = self.unmatched_stations()
+        unmatched_count = unmatched_stations.count()
+
+        if unmatched_count == 0:
+            self.stdout.write(
+                self.style.SUCCESS(
+                    "There are no unmatched stations requiring "
+                    "city-level fallback geocoding."
+                )
+            )
+            return
+
+        representatives = list(
+            unmatched_stations.order_by(
+                "state",
+                "city",
+                "opis_id",
+            )
+            .distinct("state", "city")
+            .only(
+                "id",
+                "opis_id",
+                "city",
+                "state",
+            )[:batch_size]
+        )
+
+        inputs = [
+            {
+                "id": station.opis_id,
+                "params": build_city_geocoding_params(
+                    station
+                ),
+            }
+            for station in representatives
+        ]
+
+        try:
+            result = GeoapifyClient().submit_geocoding_batch(
+                inputs,
+                priority=priority,
+            )
+        except (GeoapifyError, ValueError) as error:
+            raise CommandError(str(error)) from error
+
+        cities_by_state = {}
+
+        for station in representatives:
+            cities_by_state.setdefault(
+                station.state,
+                set(),
+            ).add(station.city)
+
+        selected_groups = Q()
+
+        for state, cities in cities_by_state.items():
+            selected_groups |= Q(
+                state=state,
+                city__in=tuple(cities),
+            )
+
+        stations_to_update = self.unmatched_stations().filter(
+            selected_groups
+        )
+        expected_station_count = stations_to_update.count()
+
+        try:
+            updated_count = stations_to_update.update(
+                geocoding_job_id=result.job_id,
+                geocoding_provider=GEOCODING_PROVIDER,
+                geocoding_status=(
+                    FuelStation.GeocodingStatus.SUBMITTED
+                ),
+                updated_at=timezone.now(),
+            )
+        except DatabaseError as error:
+            raise CommandError(
+                "Geoapify accepted city-fallback job "
+                f"{result.job_id}, but the database update "
+                "failed. Save this job ID before retrying."
+            ) from error
+
+        if updated_count != expected_station_count:
+            raise CommandError(
+                "Geoapify accepted city-fallback job "
+                f"{result.job_id}, but only {updated_count} "
+                f"of {expected_station_count} stations were "
+                "marked as submitted. Save this job ID."
+            )
+
+        self.stdout.write(
+            self.style.SUCCESS(
+                "\n".join(
+                    (
+                        "Geoapify city-fallback batch accepted.",
+                        f"Job ID: {result.job_id}",
+                        (
+                            "City/state groups submitted: "
+                            f"{len(representatives)}"
+                        ),
+                        (
+                            "Stations covered by the groups: "
+                            f"{updated_count}"
+                        ),
+                        (
+                            "Unmatched stations not included: "
+                            f"{unmatched_count - updated_count}"
+                        ),
+                    )
+                )
+            )
+        )
+
+        if result.is_pending:
+            self.stdout.write(
+                "The job is still processing. Retrieve it "
+                "later with:\n"
+                "python manage.py geocode_fuel_stations "
+                f"--job-id {result.job_id}"
+            )
+            return
+
+        self.stdout.write(
+            "Geoapify completed the city-fallback batch "
+            "immediately."
+        )
+        self.apply_completed_batch(result)
+
+    def submit_station_retry_batch(
+        self,
+        *,
+        batch_size,
+        priority,
+    ):
+        retry_stations = self.city_centroid_stations()
+        retry_count = retry_stations.count()
+
+        if retry_count == 0:
+            self.stdout.write(
+                self.style.SUCCESS(
+                    "There are no city-centroid stations "
+                    "requiring a proximity retry."
+                )
+            )
+            return
+
+        stations = list(
+            retry_stations.only(
+                "id",
+                "opis_id",
+                "name",
+                "city",
+                "state",
+                "location",
+            )[:batch_size]
+        )
+
+        inputs = [
+            {
+                "id": station.opis_id,
+                "params": build_proximity_retry_params(
+                    station
+                ),
+            }
+            for station in stations
+        ]
+
+        try:
+            result = GeoapifyClient().submit_geocoding_batch(
+                inputs,
+                priority=priority,
+            )
+        except (GeoapifyError, ValueError) as error:
+            raise CommandError(str(error)) from error
+
+        station_ids = [station.pk for station in stations]
+
+        try:
+            retry_timestamp = timezone.now()
+            updated_count = self.city_centroid_stations().filter(
+                pk__in=station_ids,
+            ).update(
+                geocoding_job_id=result.job_id,
+                geocoding_provider=GEOCODING_PROVIDER,
+                geocoding_status=(
+                    FuelStation.GeocodingStatus.SUBMITTED
+                ),
+                station_retry_attempted_at=retry_timestamp,
+                updated_at=retry_timestamp,
+            )
+        except DatabaseError as error:
+            raise CommandError(
+                "Geoapify accepted station-retry job "
+                f"{result.job_id}, but the database update "
+                "failed. Save this job ID before retrying."
+            ) from error
+
+        if updated_count != len(stations):
+            raise CommandError(
+                "Geoapify accepted station-retry job "
+                f"{result.job_id}, but only {updated_count} "
+                f"of {len(stations)} stations were marked "
+                "as submitted. Save this job ID."
+            )
+
+        self.stdout.write(
+            self.style.SUCCESS(
+                "\n".join(
+                    (
+                        "Geoapify station-retry batch accepted.",
+                        f"Job ID: {result.job_id}",
+                        f"Stations submitted: {updated_count}",
+                        (
+                            "City-centroid stations remaining: "
+                            f"{retry_count - updated_count}"
+                        ),
+                    )
+                )
+            )
+        )
+
+        if result.is_pending:
+            self.stdout.write(
+                "The job is still processing. Retrieve it "
+                "later with:\n"
+                "python manage.py geocode_fuel_stations "
+                f"--job-id {result.job_id}"
+            )
+            return
+
+        self.stdout.write(
+            "Geoapify completed the station-retry batch "
+            "immediately."
+        )
+        self.apply_completed_batch(result)
+
     def submit_batch(self, *, batch_size, priority):
         pending_count = self.pending_stations().count()
 
@@ -416,7 +878,7 @@ class Command(BaseCommand):
         inputs = [
             {
                 "id": station.opis_id,
-                "text": build_geocoding_query(station),
+                "params": build_geocoding_params(station),
             }
             for station in stations
         ]
@@ -553,6 +1015,7 @@ class Command(BaseCommand):
             )
 
         results_by_opis_id = {}
+        results_by_city = {}
 
         for provider_result in result.results:
             result_id = str(
@@ -570,6 +1033,26 @@ class Command(BaseCommand):
 
             results_by_opis_id[result_id] = provider_result
 
+            result_params = provider_result.get("params")
+
+            if (
+                isinstance(result_params, dict)
+                and result_params.get("type") == "city"
+            ):
+                city_key = (
+                    normalize_locality(
+                        result_params.get("city", "")
+                    ),
+                    str(
+                        result_params.get("state", "")
+                    ).strip().upper(),
+                )
+
+                if all(city_key):
+                    results_by_city[city_key] = (
+                        provider_result
+                    )
+
         timestamp = timezone.now()
         counts = Counter()
 
@@ -578,24 +1061,47 @@ class Command(BaseCommand):
                 str(station.opis_id)
             )
 
+            if provider_result is None:
+                provider_result = results_by_city.get(
+                    (
+                        normalize_locality(station.city),
+                        station.state.upper(),
+                    )
+                )
+
             outcome = classify_geocoding_result(
                 station,
                 provider_result,
             )
 
-            station.location = outcome.location
+            preserve_city_fallback = (
+                station.location is not None
+                and outcome.status
+                in {
+                    FuelStation.GeocodingStatus.UNMATCHED,
+                    FuelStation.GeocodingStatus.CITY_CENTROID,
+                }
+            )
+
+            if preserve_city_fallback:
+                station.geocoding_status = (
+                    FuelStation.GeocodingStatus.CITY_CENTROID
+                )
+            else:
+                station.location = outcome.location
+                station.geocoding_status = outcome.status
+                station.geocoding_confidence = (
+                    outcome.confidence
+                )
+                station.matched_address = (
+                    outcome.matched_address
+                )
+                station.geocoded_at = timestamp
+
             station.geocoding_provider = GEOCODING_PROVIDER
-            station.geocoding_status = outcome.status
-            station.geocoding_confidence = (
-                outcome.confidence
-            )
-            station.matched_address = (
-                outcome.matched_address
-            )
-            station.geocoded_at = timestamp
             station.updated_at = timestamp
 
-            counts[outcome.status] += 1
+            counts[station.geocoding_status] += 1
 
         try:
             FuelStation.objects.bulk_update(
@@ -647,6 +1153,24 @@ class Command(BaseCommand):
             geocoding_status=(
                 FuelStation.GeocodingStatus.PENDING
             )
+        ).order_by("opis_id")
+
+    @staticmethod
+    def unmatched_stations():
+        return FuelStation.objects.filter(
+            geocoding_status=(
+                FuelStation.GeocodingStatus.UNMATCHED
+            )
+        ).order_by("opis_id")
+
+    @staticmethod
+    def city_centroid_stations():
+        return FuelStation.objects.filter(
+            geocoding_status=(
+                FuelStation.GeocodingStatus.CITY_CENTROID
+            ),
+            location__isnull=False,
+            station_retry_attempted_at__isnull=True,
         ).order_by("opis_id")
 
     @staticmethod

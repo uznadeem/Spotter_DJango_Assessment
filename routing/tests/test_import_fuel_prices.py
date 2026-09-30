@@ -198,6 +198,7 @@ class ImportFuelPricesTests(TestCase):
             "I-80 Exit 1, Test City, TX, USA"
         )
         station.geocoded_at = timezone.now()
+        station.station_retry_attempted_at = timezone.now()
         station.save()
 
         changed_path = self.write_csv(
@@ -261,6 +262,7 @@ class ImportFuelPricesTests(TestCase):
             "I-80 Exit 1, Test City, TX, USA"
         )
         station.geocoded_at = timezone.now()
+        station.station_retry_attempted_at = timezone.now()
         station.save()
 
         changed_path = self.write_csv(
@@ -288,6 +290,9 @@ class ImportFuelPricesTests(TestCase):
         self.assertIsNone(station.geocoding_confidence)
         self.assertEqual(station.matched_address, "")
         self.assertIsNone(station.geocoded_at)
+        self.assertIsNone(
+            station.station_retry_attempted_at
+        )
         self.assertIn(
             "Stations requiring re-geocoding: 1",
             output,

@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import requests
@@ -79,25 +80,65 @@ class GeoapifyClient:
         request_inputs = []
 
         for item in normalized_inputs:
+            if not isinstance(item, Mapping):
+                raise ValueError(
+                    "Every Geoapify input must be a mapping."
+                )
+
             input_id = str(item["id"]).strip()
-            text = str(item["text"]).strip()
 
             if not input_id:
                 raise ValueError(
                     "Every Geoapify input requires an ID."
                 )
 
-            if not text:
+            has_text = "text" in item
+            has_params = "params" in item
+
+            if has_text == has_params:
                 raise ValueError(
-                    "Every Geoapify input requires text."
+                    "Every Geoapify input requires exactly one "
+                    "of text or params."
                 )
+
+            if has_text:
+                text = str(item["text"]).strip()
+
+                if not text:
+                    raise ValueError(
+                        "Every Geoapify text input requires text."
+                    )
+
+                input_params = {
+                    "text": text,
+                }
+            else:
+                params = item["params"]
+
+                if not isinstance(params, Mapping) or not params:
+                    raise ValueError(
+                        "Every structured Geoapify input requires "
+                        "a non-empty params mapping."
+                    )
+
+                input_params = {}
+
+                for key, value in params.items():
+                    normalized_key = str(key).strip()
+                    normalized_value = str(value).strip()
+
+                    if not normalized_key or not normalized_value:
+                        raise ValueError(
+                            "Structured Geoapify parameters cannot "
+                            "contain empty keys or values."
+                        )
+
+                    input_params[normalized_key] = normalized_value
 
             request_inputs.append(
                 {
                     "id": input_id,
-                    "params": {
-                        "text": text,
-                    },
+                    "params": input_params,
                 }
             )
 

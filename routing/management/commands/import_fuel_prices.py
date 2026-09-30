@@ -94,6 +94,7 @@ GEOCODING_FIELDS = (
     "geocoding_confidence",
     "matched_address",
     "geocoded_at",
+    "station_retry_attempted_at",
 )
 
 
@@ -466,3 +467,4 @@ class Command(BaseCommand):
         station.geocoding_confidence = None
         station.matched_address = ""
         station.geocoded_at = None
+        station.station_retry_attempted_at = None

@@ -128,6 +128,69 @@ class GeoapifyClientTests(SimpleTestCase):
         )
         self.assertIsNone(request["json"])
 
+    def test_submits_structured_geocoding_params(self):
+        self.session.request.return_value = self.response(
+            status_code=202,
+            payload={
+                "id": "job-structured",
+                "status": "pending",
+            },
+        )
+
+        self.client.submit_geocoding_batch(
+            [
+                {
+                    "id": 7,
+                    "params": {
+                        "name": "Pilot Travel Center",
+                        "city": "Gila Bend",
+                        "state": "AZ",
+                        "country": "United States",
+                        "type": "amenity",
+                    },
+                }
+            ]
+        )
+
+        payload = (
+            self.session.request.call_args.kwargs["json"]
+        )
+
+        self.assertEqual(
+            payload["inputs"],
+            [
+                {
+                    "id": "7",
+                    "params": {
+                        "name": "Pilot Travel Center",
+                        "city": "Gila Bend",
+                        "state": "AZ",
+                        "country": "United States",
+                        "type": "amenity",
+                    },
+                }
+            ],
+        )
+
+    def test_rejects_input_with_text_and_params(self):
+        with self.assertRaisesMessage(
+            ValueError,
+            "requires exactly one of text or params",
+        ):
+            self.client.submit_geocoding_batch(
+                [
+                    {
+                        "id": 7,
+                        "text": "Pilot Travel Center",
+                        "params": {
+                            "name": "Pilot Travel Center",
+                        },
+                    }
+                ]
+            )
+
+        self.session.request.assert_not_called()
+
     def test_rejects_empty_batch(self):
         with self.assertRaisesMessage(
             ValueError,

@@ -2,10 +2,16 @@ from decimal import Decimal
 from io import StringIO
 from unittest.mock import patch
 
+from django.contrib.gis.geos import Point
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import TestCase
+from django.utils import timezone
 
+from routing.management.commands.geocode_fuel_stations import (
+    classify_geocoding_result,
+    normalize_station_name,
+)
 from routing.models import FuelStation
 from routing.services.geoapify import (
     GeoapifyBatchResult,
@@ -26,6 +32,7 @@ class GeocodeFuelStationsTests(TestCase):
         *,
         status=FuelStation.GeocodingStatus.PENDING,
         job_id="",
+        city="Test City",
         state="TX",
     ):
         return FuelStation.objects.create(
@@ -33,10 +40,10 @@ class GeocodeFuelStationsTests(TestCase):
             name=f"STATION {opis_id}",
             address=f"I-80 EXIT {opis_id}",
             normalized_address=(
-                f"i-80 exit {opis_id}, test city, "
+                f"i-80 exit {opis_id}, {city.casefold()}, "
                 f"{state}"
             ),
-            city="Test City",
+            city=city,
             state=state,
             rack_id=opis_id,
             retail_price=Decimal("3.25000000"),
@@ -57,16 +64,23 @@ class GeocodeFuelStationsTests(TestCase):
         longitude=-97.2000,
         country_code="us",
         state_code="TX",
+        city="Test City",
         confidence=0.95,
         result_type="amenity",
         match_type="full_match",
         formatted=None,
+        input_params=None,
+        candidate_name=None,
     ):
         return {
             "id": str(opis_id),
-            "params": {
-                "text": f"STATION {opis_id}, USA",
-            },
+            "params": (
+                input_params
+                if input_params is not None
+                else {
+                    "text": f"STATION {opis_id}, USA",
+                }
+            ),
             "result": {
                 "results": [
                     {
@@ -74,6 +88,11 @@ class GeocodeFuelStationsTests(TestCase):
                         "lon": longitude,
                         "country_code": country_code,
                         "state_code": state_code,
+                        "city": city,
+                        "name": (
+                            candidate_name
+                            or f"Station {opis_id}"
+                        ),
                         "formatted": (
                             formatted
                             or (
@@ -176,10 +195,13 @@ class GeocodeFuelStationsTests(TestCase):
             [
                 {
                     "id": 1,
-                    "text": (
-                        "STATION 1, I-80 EXIT 1, "
-                        "Test City, TX, USA"
-                    ),
+                    "params": {
+                        "name": "STATION 1",
+                        "city": "Test City",
+                        "state": "TX",
+                        "country": "United States",
+                        "type": "amenity",
+                    },
                 }
             ],
             priority=0.5,
@@ -540,6 +562,417 @@ class GeocodeFuelStationsTests(TestCase):
         )
 
     @patch(CLIENT_PATCH_PATH)
+    def test_city_fallback_deduplicates_city_groups(
+        self,
+        client_class,
+    ):
+        first_station = self.create_station(
+            1,
+            status=FuelStation.GeocodingStatus.UNMATCHED,
+            job_id="old-job",
+            city="Alpha City",
+        )
+        second_station = self.create_station(
+            2,
+            status=FuelStation.GeocodingStatus.UNMATCHED,
+            job_id="old-job",
+            city="Alpha City",
+        )
+        other_city_station = self.create_station(
+            3,
+            status=FuelStation.GeocodingStatus.UNMATCHED,
+            job_id="old-job",
+            city="Zulu City",
+        )
+        pending_station = self.create_station(4)
+
+        client = client_class.return_value
+        client.submit_geocoding_batch.return_value = (
+            GeoapifyBatchResult(
+                job_id="city-job",
+                is_pending=True,
+            )
+        )
+
+        output = StringIO()
+
+        call_command(
+            "geocode_fuel_stations",
+            submit_city_fallback=True,
+            batch_size=1,
+            priority=0.5,
+            stdout=output,
+        )
+
+        client.submit_geocoding_batch.assert_called_once_with(
+            [
+                {
+                    "id": 1,
+                    "params": {
+                        "city": "Alpha City",
+                        "state": "TX",
+                        "country": "United States",
+                        "type": "city",
+                    },
+                }
+            ],
+            priority=0.5,
+        )
+
+        for station in (first_station, second_station):
+            station.refresh_from_db()
+            self.assertEqual(
+                station.geocoding_status,
+                FuelStation.GeocodingStatus.SUBMITTED,
+            )
+            self.assertEqual(
+                station.geocoding_job_id,
+                "city-job",
+            )
+
+        other_city_station.refresh_from_db()
+        pending_station.refresh_from_db()
+
+        self.assertEqual(
+            other_city_station.geocoding_status,
+            FuelStation.GeocodingStatus.UNMATCHED,
+        )
+        self.assertEqual(
+            pending_station.geocoding_status,
+            FuelStation.GeocodingStatus.PENDING,
+        )
+
+        command_output = output.getvalue()
+        self.assertIn(
+            "City/state groups submitted: 1",
+            command_output,
+        )
+        self.assertIn(
+            "Stations covered by the groups: 2",
+            command_output,
+        )
+
+    @patch(CLIENT_PATCH_PATH)
+    def test_city_fallback_result_is_shared_by_city(
+        self,
+        client_class,
+    ):
+        first_station = self.create_station(
+            1,
+            status=FuelStation.GeocodingStatus.UNMATCHED,
+            job_id="old-job",
+        )
+        second_station = self.create_station(
+            2,
+            status=FuelStation.GeocodingStatus.UNMATCHED,
+            job_id="old-job",
+        )
+
+        city_params = {
+            "city": "Test City",
+            "state": "TX",
+            "country": "United States",
+            "type": "city",
+        }
+
+        client = client_class.return_value
+        client.submit_geocoding_batch.return_value = (
+            GeoapifyBatchResult(
+                job_id="city-job",
+                is_pending=False,
+                results=(
+                    self.provider_result(
+                        1,
+                        confidence=0.99,
+                        result_type="suburb",
+                        city="Test City",
+                        longitude=-97.5,
+                        latitude=32.5,
+                        input_params=city_params,
+                    ),
+                ),
+            )
+        )
+
+        call_command(
+            "geocode_fuel_stations",
+            submit_city_fallback=True,
+            batch_size=1,
+        )
+
+        for station in (first_station, second_station):
+            station.refresh_from_db()
+
+            self.assertEqual(
+                station.geocoding_status,
+                FuelStation.GeocodingStatus.CITY_CENTROID,
+            )
+            self.assertEqual(
+                station.geocoding_job_id,
+                "city-job",
+            )
+            self.assertIsNotNone(station.location)
+            self.assertAlmostEqual(
+                station.location.x,
+                -97.5,
+            )
+            self.assertAlmostEqual(
+                station.location.y,
+                32.5,
+            )
+
+    @patch(CLIENT_PATCH_PATH)
+    def test_station_retry_uses_city_centroid_as_search_bias(
+        self,
+        client_class,
+    ):
+        station = self.create_station(
+            1,
+            status=FuelStation.GeocodingStatus.CITY_CENTROID,
+            job_id="city-job",
+        )
+        station.location = Point(-97.5, 32.5, srid=4326)
+        station.geocoding_confidence = Decimal("0.9900")
+        station.matched_address = "Test City, TX, USA"
+        station.geocoded_at = timezone.now()
+        station.save(
+            update_fields=(
+                "location",
+                "geocoding_confidence",
+                "matched_address",
+                "geocoded_at",
+            )
+        )
+
+        client = client_class.return_value
+        client.submit_geocoding_batch.return_value = (
+            GeoapifyBatchResult(
+                job_id="retry-job",
+                is_pending=True,
+            )
+        )
+
+        output = StringIO()
+
+        call_command(
+            "geocode_fuel_stations",
+            submit_station_retry=True,
+            batch_size=1,
+            priority=0.5,
+            stdout=output,
+        )
+
+        client.submit_geocoding_batch.assert_called_once_with(
+            [
+                {
+                    "id": 1,
+                    "params": {
+                        "name": "STATION 1",
+                        "city": "Test City",
+                        "state": "TX",
+                        "country": "United States",
+                        "type": "amenity",
+                        "filter": (
+                            "circle:-97.500000,32.500000,50000"
+                        ),
+                    },
+                }
+            ],
+            priority=0.5,
+        )
+
+        station.refresh_from_db()
+
+        self.assertEqual(
+            station.geocoding_status,
+            FuelStation.GeocodingStatus.SUBMITTED,
+        )
+        self.assertEqual(
+            station.geocoding_job_id,
+            "retry-job",
+        )
+        self.assertIsNotNone(
+            station.station_retry_attempted_at
+        )
+        self.assertAlmostEqual(station.location.x, -97.5)
+        self.assertAlmostEqual(station.location.y, 32.5)
+        self.assertIn(
+            "Geoapify station-retry batch accepted.",
+            output.getvalue(),
+        )
+
+    def test_proximity_retry_accepts_nearby_locality_as_approximate(
+        self,
+    ):
+        station = self.create_station(1)
+        provider_result = self.provider_result(
+            1,
+            city="Nearby City",
+            confidence=0.99,
+            result_type="amenity",
+            match_type="full_match",
+            input_params={
+                "name": "STATION 1",
+                "city": "Test City",
+                "state": "TX",
+                "country": "United States",
+                "type": "amenity",
+                "filter": "circle:-97.500000,32.500000,50000",
+            },
+        )
+
+        outcome = classify_geocoding_result(
+            station,
+            provider_result,
+        )
+
+        self.assertEqual(
+            outcome.status,
+            FuelStation.GeocodingStatus.APPROXIMATE,
+        )
+        self.assertIsNotNone(outcome.location)
+
+    @patch(CLIENT_PATCH_PATH)
+    def test_failed_station_retry_preserves_city_centroid(
+        self,
+        client_class,
+    ):
+        original_geocoded_at = timezone.now()
+        station = self.create_station(
+            1,
+            status=FuelStation.GeocodingStatus.CITY_CENTROID,
+            job_id="city-job",
+        )
+        station.location = Point(-97.5, 32.5, srid=4326)
+        station.geocoding_confidence = Decimal("0.9900")
+        station.matched_address = "Test City, TX, USA"
+        station.geocoded_at = original_geocoded_at
+        station.save(
+            update_fields=(
+                "location",
+                "geocoding_confidence",
+                "matched_address",
+                "geocoded_at",
+            )
+        )
+
+        client = client_class.return_value
+        client.submit_geocoding_batch.return_value = (
+            GeoapifyBatchResult(
+                job_id="retry-job",
+                is_pending=False,
+                results=(),
+            )
+        )
+
+        output = StringIO()
+
+        call_command(
+            "geocode_fuel_stations",
+            submit_station_retry=True,
+            batch_size=1,
+            stdout=output,
+        )
+
+        station.refresh_from_db()
+
+        self.assertEqual(
+            station.geocoding_status,
+            FuelStation.GeocodingStatus.CITY_CENTROID,
+        )
+        self.assertAlmostEqual(station.location.x, -97.5)
+        self.assertAlmostEqual(station.location.y, 32.5)
+        self.assertEqual(
+            station.geocoding_confidence,
+            Decimal("0.9900"),
+        )
+        self.assertEqual(
+            station.matched_address,
+            "Test City, TX, USA",
+        )
+        self.assertEqual(
+            station.geocoded_at,
+            original_geocoded_at,
+        )
+        self.assertIsNotNone(
+            station.station_retry_attempted_at
+        )
+        self.assertIn("City centroid: 1", output.getvalue())
+
+        second_output = StringIO()
+        call_command(
+            "geocode_fuel_stations",
+            submit_station_retry=True,
+            stdout=second_output,
+        )
+
+        self.assertIn(
+            "There are no city-centroid stations requiring "
+            "a proximity retry.",
+            second_output.getvalue(),
+        )
+        self.assertEqual(
+            client.submit_geocoding_batch.call_count,
+            1,
+        )
+
+    def test_rejects_candidate_from_different_city(self):
+        station = self.create_station(1)
+
+        provider_result = self.provider_result(
+            1,
+            city="Different City",
+            state_code="TX",
+            confidence=1,
+            result_type="amenity",
+            match_type="full_match",
+        )
+
+        outcome = classify_geocoding_result(
+            station,
+            provider_result,
+        )
+
+        self.assertEqual(
+            outcome.status,
+            FuelStation.GeocodingStatus.UNMATCHED,
+        )
+        self.assertIsNone(outcome.location)
+
+    def test_city_fallback_accepts_matching_locality_name(self):
+        station = self.create_station(
+            1,
+            city="Columbia",
+            state="NJ",
+        )
+
+        provider_result = self.provider_result(
+            1,
+            city="Knowlton Township",
+            state_code="NJ",
+            candidate_name="Columbia",
+            confidence=1,
+            result_type="suburb",
+            input_params={
+                "city": "Columbia",
+                "state": "NJ",
+                "country": "United States",
+                "type": "city",
+            },
+        )
+
+        outcome = classify_geocoding_result(
+            station,
+            provider_result,
+        )
+
+        self.assertEqual(
+            outcome.status,
+            FuelStation.GeocodingStatus.CITY_CENTROID,
+        )
+        self.assertIsNotNone(outcome.location)
+
+    @patch(CLIENT_PATCH_PATH)
     def test_provider_failure_leaves_station_pending(
         self,
         client_class,
@@ -607,3 +1040,34 @@ class GeocodeFuelStationsTests(TestCase):
             )
 
         client_class.assert_not_called()
+
+
+class StationNameNormalizationTests(TestCase):
+    def test_normalizes_known_fuel_brands(self):
+        examples = {
+            "PILOT TRAVEL CENTER #1243": (
+                "Pilot Travel Center"
+            ),
+            "FLYING J TRAVEL PLAZA #650": "Flying J",
+            "LOVES TRAVEL STOP #766": "Love's Travel Stop",
+            "TA SAGINAW I 75 TRAVEL CENTER": (
+                "TA Travel Center"
+            ),
+            "PETRO STOPPING CENTER #348": (
+                "Petro Travel Center"
+            ),
+            "CIRCLE K #2612042": "Circle K",
+        }
+
+        for source_name, expected_name in examples.items():
+            with self.subTest(source_name=source_name):
+                self.assertEqual(
+                    normalize_station_name(source_name),
+                    expected_name,
+                )
+
+    def test_removes_store_number_from_unknown_brand(self):
+        self.assertEqual(
+            normalize_station_name("LOCAL TRUCK STOP #123"),
+            "LOCAL TRUCK STOP",
+        )
