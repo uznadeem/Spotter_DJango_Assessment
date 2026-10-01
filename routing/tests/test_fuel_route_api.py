@@ -248,6 +248,36 @@ class FuelRouteAPITests(SimpleTestCase):
             "Finish is required.",
         )
 
+    def test_rejects_same_resolved_location(self):
+        self.routing_service.geocode.side_effect = [
+            self.start,
+            self.start,
+        ]
+
+        response = self.post(
+            {
+                "start": "Denver, CO",
+                "finish": "Denver City Center",
+            }
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json(),
+            {
+                "error": {
+                    "code": "same_location",
+                    "message": (
+                        "Start and finish must be different "
+                        "locations."
+                    ),
+                }
+            },
+        )
+        self.routing_service.get_driving_route.assert_not_called()
+        self.station_search.assert_not_called()
+        self.optimizer.assert_not_called()
+
     def test_rejects_unsupported_content_type(self):
         response = self.client.post(
             self.url,

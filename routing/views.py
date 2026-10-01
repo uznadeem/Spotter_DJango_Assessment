@@ -79,6 +79,7 @@ def fuel_route(request):
             finish_query,
             field_name="finish",
         )
+        _validate_distinct_locations(start, finish)
         route = routing_service.get_driving_route(
             start.coordinates,
             finish.coordinates,
@@ -229,6 +230,15 @@ def _geocode_location(service, query, *, field_name):
             ),
             status=404,
         ) from error
+
+
+def _validate_distinct_locations(start, finish):
+    if start.coordinates == finish.coordinates:
+        raise APIError(
+            code="same_location",
+            message="Start and finish must be different locations.",
+            status=400,
+        )
 
 
 def _build_response(*, start, finish, route, plan):
