@@ -1,0 +1,177 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta
+        name="description"
+        content="Interactive demonstration of the Fuel Route API."
+    >
+    <title>Fuel Route Planner</title>
+    <link
+        rel="stylesheet"
+        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+        crossorigin=""
+    >
+    <link
+        rel="stylesheet"
+        href="{% static 'routing/demo.css' %}"
+    >
+    <script
+        src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+        crossorigin=""
+        defer
+    ></script>
+    <script src="{% static 'routing/demo.js' %}" defer></script>
+</head>
+<body>
+    <div
+        class="app-shell"
+        data-route-demo
+        data-api-url="{% url 'routing:fuel-route' %}"
+        data-map-api-key="{{ geoapify_api_key }}"
+    >
+        <header class="site-header">
+            <a class="brand" href="{% url 'route-demo' %}">
+                <span class="brand-mark" aria-hidden="true">FR</span>
+                <span>
+                    <strong>Fuel Route</strong>
+                    <small>Cost-effective trip planning</small>
+                </span>
+            </a>
+            <span class="api-badge">Django API demo</span>
+        </header>
+
+        <main class="workspace">
+            <aside class="control-panel" aria-label="Route controls">
+                <section class="intro">
+                    <p class="eyebrow">Route planner</p>
+                    <h1>Plan the drive, not the fuel stops.</h1>
+                    <p>
+                        Enter two US locations to find a driving route and
+                        cost-effective fuel stops for a 500-mile vehicle.
+                    </p>
+                </section>
+
+                <form class="route-form" data-route-form>
+                    <div class="location-fields">
+                        <label class="field">
+                            <span>Starting location</span>
+                            <input
+                                type="text"
+                                name="start"
+                                value="New York, NY"
+                                maxlength="255"
+                                autocomplete="off"
+                                required
+                            >
+                        </label>
+
+                        <button
+                            class="swap-button"
+                            type="button"
+                            data-swap-locations
+                            aria-label="Swap start and finish locations"
+                            title="Swap locations"
+                        >
+                            <span aria-hidden="true">&#8645;</span>
+                        </button>
+
+                        <label class="field">
+                            <span>Destination</span>
+                            <input
+                                type="text"
+                                name="finish"
+                                value="Los Angeles, CA"
+                                maxlength="255"
+                                autocomplete="off"
+                                required
+                            >
+                        </label>
+                    </div>
+
+                    <button class="submit-button" type="submit">
+                        <span data-button-label>Calculate route</span>
+                        <span
+                            class="spinner"
+                            data-button-spinner
+                            aria-hidden="true"
+                            hidden
+                        ></span>
+                    </button>
+                </form>
+
+                <p
+                    class="status-message"
+                    data-status-message
+                    role="status"
+                    aria-live="polite"
+                >
+                    Ready to calculate a route.
+                </p>
+
+                <section class="result-summary" data-result-summary hidden>
+                    <div class="result-heading">
+                        <p class="eyebrow">Trip summary</p>
+                        <h2 data-route-title></h2>
+                    </div>
+
+                    <dl class="metric-grid">
+                        <div>
+                            <dt>Distance</dt>
+                            <dd><span data-distance></span> mi</dd>
+                        </div>
+                        <div>
+                            <dt>Drive time</dt>
+                            <dd data-duration></dd>
+                        </div>
+                        <div>
+                            <dt>Fuel stops</dt>
+                            <dd data-stop-count></dd>
+                        </div>
+                        <div class="cost-metric">
+                            <dt>Fuel cost</dt>
+                            <dd>$<span data-total-cost></span></dd>
+                        </div>
+                    </dl>
+
+                    <div class="stop-section">
+                        <div class="section-heading">
+                            <h2>Recommended stops</h2>
+                            <span>Within 5 miles of the route</span>
+                        </div>
+                        <ol class="stop-list" data-stop-list></ol>
+                    </div>
+                </section>
+            </aside>
+
+            <section class="map-panel" aria-label="Route map">
+                <div
+                    id="route-map"
+                    class="route-map"
+                    data-route-map
+                    role="region"
+                    aria-label="Interactive route and fuel stop map"
+                ></div>
+                <div class="map-message" data-map-message>
+                    <strong>Your route will appear here.</strong>
+                    <span>Start with the example or enter two US locations.</span>
+                </div>
+                <div class="map-legend" aria-label="Map legend">
+                    <span><i class="legend-dot start-dot"></i> Start</span>
+                    <span><i class="legend-dot fuel-dot"></i> Fuel stop</span>
+                    <span><i class="legend-dot finish-dot"></i> Finish</span>
+                </div>
+            </section>
+        </main>
+
+        <footer class="site-footer">
+            <span>Assumptions: full starting tank, 500-mile range, 10 MPG.</span>
+            <code>POST {% url 'routing:fuel-route' %}</code>
+        </footer>
+    </div>
+</body>
+</html>

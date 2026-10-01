@@ -2,8 +2,11 @@ import json
 import logging
 from decimal import Decimal, ROUND_HALF_UP
 
+from django.conf import settings
 from django.http import JsonResponse
+from django.shortcuts import render
 from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_GET
 
 from routing.services.fuel_optimizer import (
     FUEL_EFFICIENCY_MPG,
@@ -36,6 +39,17 @@ class APIError(Exception):
         self.code = code
         self.message = message
         self.status = status
+
+
+@require_GET
+def route_demo(request):
+    return render(
+        request,
+        "routing/demo.html",
+        {
+            "geoapify_api_key": settings.GEOAPIFY_API_KEY,
+        },
+    )
 
 
 @csrf_exempt
