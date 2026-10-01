@@ -1,3 +1,4 @@
+import gzip
 import json
 from decimal import Decimal
 from unittest.mock import patch
@@ -183,6 +184,35 @@ class FuelRouteAPITests(SimpleTestCase):
         self.optimizer.assert_called_once_with(
             self.route,
             (self.station,),
+        )
+
+    def test_gzip_preserves_complete_route_geometry(self):
+        response = self.client.post(
+            self.url,
+            data=json.dumps(
+                {
+                    "start": "Denver, CO",
+                    "finish": "Salt Lake City, UT",
+                }
+            ),
+            content_type="application/json",
+            HTTP_ACCEPT_ENCODING="gzip",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.headers["Content-Encoding"],
+            "gzip",
+        )
+
+        body = json.loads(
+            gzip.decompress(response.content)
+        )
+        route_feature = body["map"]["features"][0]
+
+        self.assertEqual(
+            route_feature["geometry"]["coordinates"],
+            self.route.geometry["coordinates"],
         )
 
     def test_rejects_invalid_json(self):
